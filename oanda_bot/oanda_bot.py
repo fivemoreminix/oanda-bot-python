@@ -1,5 +1,6 @@
 import requests
 from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.schedulers.base import SchedulerAlreadyRunningError
 from typing import Tuple, Any
 import numpy as np
 import pandas as pd
@@ -15,6 +16,7 @@ from discordwebhook import Discord
 import time
 import dateutil.parser
 import matplotlib.dates as mdates
+from termcolor import colored
 
 
 class Bot(object):
@@ -26,6 +28,7 @@ class Bot(object):
         *,
         account_id: str,
         access_token: str,
+        lot_size: int = 1,
         environment: str = "practice",
         instrument: str = "EUR_USD",
         granularity: str = "D",
@@ -90,7 +93,7 @@ class Bot(object):
             self.point = 0.01
         else:
             self.point = 0.0001
-        self.units = 10000  # currency unit
+        self.units = lot_size  # currency unit
         self.take_profit = 0
         self.stop_loss = 0
         self.buy_entry = (
@@ -146,6 +149,8 @@ class Bot(object):
             res = requests.get(url, headers=self.headers, params=params)
             if res.status_code != 200:
                 self._error("status_code {} - {}".format(res.status_code, res.json()))
+                return None
+            
             for r in res.json()["candles"]:
                 data.append(
                     [
@@ -157,6 +162,7 @@ class Bot(object):
                         float(r["volume"]),
                     ]
                 )
+        
         self.df = (
             pd.DataFrame(data, columns=["T", "O", "H", "L", "C", "V"])
             .set_index("T")
@@ -171,15 +177,15 @@ class Bot(object):
             self._error("status_code {} - {}".format(res.status_code, res.json()))
         return res
 
-    def _account(self) -> Tuple[bool, bool]:
-        buy_position = False
-        sell_position = False
-        for pos in self.__accounts().json()["account"]["positions"]:
+    def _account(self) -> dict:
+        buy_position = None
+        sell_position = None
+        for pos in self.account_summary()["positions"]:
             if pos["instrument"] == self.instrument:
                 if pos["long"]["units"] != "0":
-                    buy_position = True
+                    buy_position = pos
                 if pos["short"]["units"] != "0":
-                    sell_position = True
+                    sell_position = pos
         return buy_position, sell_position
 
     def __order(self, data: Any) -> requests.models.Response:
@@ -197,6 +203,7 @@ class Bot(object):
         order["positionFill"] = "DEFAULT"
         res = self.__order({"order": order})
         order_id = res.json()["orderFillTransaction"]["id"]
+        print("Issued order: {}".format(order_id))
         price = float(res.json()["orderFillTransaction"]["price"])
         if self.stop_loss != 0 and entry:
             stop_loss = {}
@@ -230,33 +237,48 @@ class Bot(object):
         return False
 
     def _job(self) -> None:
+        """
+        This is the job that is executed by the scheduler every 5 second (S5) or 15 minutes (M15), etc.
+        """
         if self._is_close():
             return None
         self._candles(count="500")
         self.strategy()
+        # self.log.info(msg="waiting for setup...")
         buy_position, sell_position = self._account()
+
+        # sell entry is not being enabled
         buy_entry = self.buy_entry[-1]
         sell_entry = self.sell_entry[-1]
         buy_exit = self.buy_exit[-1]
         sell_exit = self.sell_exit[-1]
+
         # buy entry
-        if buy_entry and not buy_position:
+        if buy_entry and not buy_position: # If we are not long, we need to buy
             if sell_position:
-                self._order(self.BUY)
-            self._order(self.BUY, self.ENTRY)
+                self._order(self.BUY) # We are short, so we need to buy to exit
+            self._order(self.BUY, self.ENTRY) # We are not long, so we need to buy to enter
+            self.log.info(msg=colored("BUY {} units @ {}".format(self.units, self.df.C[-1]), 'blue', 'on_black'))
             return None
         # sell entry
-        if sell_entry and not sell_position:
+        if sell_entry and not sell_position: # If we are not short, we need to sell
             if buy_position:
-                self._order(self.SELL)
-            self._order(self.SELL, self.ENTRY)
+                self._order(self.SELL) # We are long, so we need to sell to exit
+            self._order(self.SELL, self.ENTRY) # We are not short, so we need to sell to enter
+            self.log.info(msg=colored("SELL {} units @ {}".format(self.units, self.df.C[-1]), 'red', 'on_black'))
             return None
         # buy exit
         if buy_exit and buy_position:
-            self._order(self.SELL)
+            self._order(self.SELL) # We are long, so we need to sell to exit
+            self.log.info(msg=colored("EXIT {} units @ {}".format(self.units, self.df.C[-1]), 'blue', 'on_black'))
+            # Print the profit from the last trade
+            self.log.info(msg=colored("PROFIT: ${}".format(buy_position["pl"]), 'green'))
         # sell exit
         if sell_exit and sell_position:
-            self._order(self.BUY)
+            self._order(self.BUY) # We are short, so we need to buy to exit
+            self.log.info(msg=colored("EXIT {} units @ {}".format(self.units, self.df.C[-1]), 'red', 'on_black'))
+            # Print the profit from the last trade
+            self.log.info(msg=colored("PROFIT: ${}".format(sell_position["pl"]), 'green'))
 
     def _error(self, message: Any = {}) -> None:
         self.log.error(message)
@@ -282,6 +304,36 @@ class Bot(object):
         if res.status_code != 200:
             self._error("status_code {} - {}".format(res.status_code, res.json()))
         return res
+
+    def account_summary(self) -> dict:
+        """
+        https://developer.oanda.com/rest-live-v20/account-df/
+        {
+            "id": (account id),
+            "alias": (account alias),
+            "createdTime": (DateTime),
+            "openTradeCount": (integer),
+            "openPositionCount": (integer),
+            "pendingOrderCount": (integer),
+            "hedgingEnabled": (boolean),
+            "unrealizedPL": (AccountUnits),
+            "NAV": (AccountUnits),
+            "marginUsed": (AccountUnits),
+            "marginAvailable": (AccountUnits),
+            "positionValue": (AccountUnits),
+            "marginCloseoutUnrealizedPL": (AccountUnits),
+            "marginCloseoutNAV": (AccountUnits),
+            "marginCloseoutMarginUsed": (AccountUnits),
+            "marginCloseoutPercent": (DecimalNumber),
+            "marginCloseoutPositionValue": (AccountUnits),
+            "withdrawalLimit": (AccountUnits),
+            "marginCallMarginUsed": (AccountUnits),
+            "marginCallPercent": (DecimalNumber),
+            "balance": (AccountUnits),
+            "pl": (AccountUnits),
+        }
+        """
+        return self.__accounts().json()["account"]
 
     def report(self, *, days: int = -1, filename: str = "",) -> None:
         tran = self.__transactions(
@@ -317,6 +369,7 @@ class Bot(object):
         ).set_index("time")
 
         s = pd.Series(dtype="object")
+        s.loc["duration"] = str(df.index[-1] - df.index[0])
         s.loc["total profit"] = round(df["pl"].sum(), 3)
         s.loc["total trades"] = len(df["pl"])
         s.loc["win rate"] = round(len(df[df["pl"] > 0]) / len(df["pl"]) * 100, 3)
@@ -363,7 +416,14 @@ class Bot(object):
         else:
             plt.savefig(filename)
 
-    def strategy(self) -> None:
+    def strategy(self, is_backtest=False) -> None:
+        """
+        Override this method to implement your strategy. This method is called
+        one time at the start of backtesting or at each tick during live trading.
+        A tick is defined as the close of a new candlestick in your granularity.
+        For this reason, it is important to use the close price of the candlestick
+        and to always set a stop loss.
+        """
         pass
 
     def backtest(
@@ -380,7 +440,8 @@ class Bot(object):
             self._candles(from_date=from_date, to_date=to_date)
             if from_date != "" and to_date != "":
                 self.df.to_csv(csv)
-        self.strategy()
+        
+        self.strategy(is_backtest=True)
         o = self.df.O.values
         L = self.df.L.values
         h = self.df.H.values
@@ -563,9 +624,20 @@ class Bot(object):
             plt.show()
         else:
             plt.savefig(filename)
+    
+    def close_all_trades(self) -> None:
+        buy_position, sell_position = self._account()
+        if buy_position: # TODO: this will cause problems with running more than one bot at a time
+            self._order(self.SELL)
+        if sell_position:
+            self._order(self.BUY)
 
     def run(self) -> None:
-        self.sched.start()
+        try:
+            self.sched.start()
+        except KeyboardInterrupt:
+            self.sched.shutdown()
+            self.close_all_trades()
 
     def sma(self, *, period: int, price: str = "C") -> pd.DataFrame:
         return self.df[price].rolling(period).mean()
@@ -579,6 +651,29 @@ class Bot(object):
         std = self.df[price].rolling(period).std()
         mean = self.df[price].rolling(period).mean()
         return mean + (std * band), mean, mean - (std * band)
+
+    def ichimoku(
+        self,
+        conv_period: int = 9,
+        base_period: int = 26,
+        lagging_span_period: int = 26,
+        span_b_period: int = 52,
+    ) -> dict:
+        """
+        Returns: dict of pandas.Series of conv, base, lagging_span, span_a, span_b.
+        """
+        conv = (self.df.H.rolling(conv_period).max() + self.df.L.rolling(conv_period).min()) / 2
+        base = (self.df.H.rolling(base_period).max() + self.df.L.rolling(base_period).min()) / 2
+        lagging_span = self.df.C
+        span_a = (conv + base) / 2
+        span_b = (self.df.H.rolling(span_b_period).max() + self.df.L.rolling(span_b_period).min()) / 2
+        return {
+            "conv": conv,
+            "base": base,
+            "lagging_span": lagging_span.shift(-lagging_span_period),
+            "span_a": span_a.shift(lagging_span_period),
+            "span_b": span_b.shift(lagging_span_period),
+        }
 
     def macd(
         self,
