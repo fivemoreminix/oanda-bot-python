@@ -247,7 +247,6 @@ class Bot(object):
         # self.log.info(msg="waiting for setup...")
         buy_position, sell_position = self._account()
 
-        # sell entry is not being enabled
         buy_entry = self.buy_entry[-1]
         sell_entry = self.sell_entry[-1]
         buy_exit = self.buy_exit[-1]
@@ -440,7 +439,7 @@ class Bot(object):
             self._candles(from_date=from_date, to_date=to_date)
             if from_date != "" and to_date != "":
                 self.df.to_csv(csv)
-        
+
         self.strategy(is_backtest=True)
         o = self.df.O.values
         L = self.df.L.values
@@ -638,6 +637,16 @@ class Bot(object):
         except KeyboardInterrupt:
             self.sched.shutdown()
             self.close_all_trades()
+    
+    def atr(self, *, period: int = 14) -> pd.DataFrame:
+        tr = pd.DataFrame(
+            {
+                "H-L": self.df.H - self.df.L,
+                "H-Cp": abs(self.df.H - self.df.C.shift(1)),
+                "L-Cp": abs(self.df.L - self.df.C.shift(1)),
+            }
+        )
+        return tr.max(axis=1).rolling(period).mean()
 
     def sma(self, *, period: int, price: str = "C") -> pd.DataFrame:
         return self.df[price].rolling(period).mean()
